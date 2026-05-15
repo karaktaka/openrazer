@@ -110,23 +110,13 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
         'set_spectrum_effect', 'set_none_effect', 'set_breath_random_effect',
         'set_breath_single_effect', 'set_breath_dual_effect',
         'set_mouse_dock_pro_pair', 'set_mouse_dock_pro_unpair',
-        'max_dpi', 'get_dpi_xy', 'set_dpi_xy', 'get_dpi_stages', 'set_dpi_stages',
-        'get_poll_rate', 'set_poll_rate',
-        'get_battery', 'is_charging',
-        'get_scroll_mode', 'set_scroll_mode',
-        'get_scroll_acceleration', 'set_scroll_acceleration',
-        'get_scroll_smart_reel', 'set_scroll_smart_reel',
-        'get_idle_time', 'set_idle_time',
-        'get_low_battery_threshold', 'set_low_battery_threshold',
-        'get_logo_brightness', 'set_logo_brightness',
-        'get_scroll_brightness', 'set_scroll_brightness',
-        'set_logo_wave', 'set_logo_static', 'set_logo_spectrum', 'set_logo_none',
-        'set_scroll_wave', 'set_scroll_static', 'set_scroll_spectrum', 'set_scroll_none',
     ]
 
     DEVICE_IMAGE = "https://dl.razerzone.com/src2/6229/6229-1-en-v2.png"
 
-    DPI_MAX = 30000
+    def get_child_devices(self):
+        from openrazer_daemon.hardware.mouse import RazerBasiliskV3ProDocked
+        return [(RazerBasiliskV3ProDocked, {'id_suffix': ':mouse', 'serial_suffix': '__mouse'})]
 
 
 class RazerNommoChroma(_RazerDeviceBrightnessSuspend):
