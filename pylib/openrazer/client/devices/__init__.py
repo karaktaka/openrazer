@@ -66,7 +66,7 @@ class RazerDevice(object):
             'macro_mode_modifier': self._has_feature('razer.device.macro', 'setModeModifier'),
             'reactive_trigger': self._has_feature('razer.device.misc', 'triggerReactive'),
             'dock_pro_pair': self._has_feature('razer.device.misc', ('setMouseDockProPair', 'setMouseDockProUnpair')),
-            'dock_pro_nearby_discovery': self._has_feature('razer.device.misc', ('getNearbyMice', 'pairAnyNearbyMouse')),
+            'dock_pro_nearby_discovery': self._has_feature('razer.device.misc', ('getNearbyMice', 'pairAnyNearbyMouse', 'scanForNearbyMice')),
 
             'poll_rate': self._has_feature('razer.device.misc', ('getPollRate', 'setPollRate')),
             'supported_poll_rates': self._has_feature('razer.device.misc', 'getSupportedPollRates'),
@@ -602,6 +602,19 @@ class RazerDevice(object):
         else:
             raise NotImplementedError()
 
+    def scan_for_nearby_mice(self) -> None:
+        """
+        Ask the dock to scan for nearby Razer mice.  The dock's scan is
+        one-shot — call this before reading ``nearby_mice`` if you need
+        fresh results.  Results land in the cache within a few hundred ms.
+
+        :raises NotImplementedError: If function is not supported
+        """
+        if self.has('dock_pro_nearby_discovery'):
+            self._dbus_interfaces['device'].scanForNearbyMice()
+        else:
+            raise NotImplementedError()
+
     @property
     def nearby_mice(self) -> list:
         """
@@ -609,7 +622,8 @@ class RazerDevice(object):
 
         Each entry is a 4-hex-digit USB product ID string (e.g. "00ab" for
         a Basilisk V3 Pro Wireless).  Empty list if no mouse has beaconed
-        in the last ~30 seconds.
+        in the last ~30 seconds.  Call :meth:`scan_for_nearby_mice` first
+        to trigger a fresh dock scan if needed.
 
         :return: list of mouse PID strings
         :rtype: list[str]

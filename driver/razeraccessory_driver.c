@@ -3001,6 +3001,17 @@ static void razer_mouse_dock_pro_start_scan(struct razer_accessory_device *devic
     razer_send_payload(device, &request, &response);
 }
 
+/* Userspace trigger for the scan command above.  Writing anything to this
+ * attribute kicks off a fresh nearby-mice scan; results show up in
+ * nearby_mice within a few hundred ms.  Needed because the dock's scan is
+ * one-shot, not continuous, so the cache goes stale after a while. */
+static ssize_t razer_attr_write_scan_for_mice(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct razer_accessory_device *device = dev_get_drvdata(dev);
+    razer_mouse_dock_pro_start_scan(device);
+    return count;
+}
+
 /**
  * Set up the device driver files
 
@@ -3094,6 +3105,7 @@ static DEVICE_ATTR(scroll_matrix_effect_none,               0220, NULL,         
 static DEVICE_ATTR(mouse_serial,                            0440, razer_attr_read_mouse_serial,                  NULL);
 static DEVICE_ATTR(mouse_connected,                         0440, razer_attr_read_mouse_connected,               NULL);
 static DEVICE_ATTR(nearby_mice,                             0440, razer_attr_read_nearby_mice,                   NULL);
+static DEVICE_ATTR(scan_for_mice,                           0220, NULL,                                          razer_attr_write_scan_for_mice);
 static DEVICE_ATTR(mouse_firmware,                          0440, razer_attr_read_mouse_firmware,                NULL);
 static DEVICE_ATTR(mouse_matrix_brightness,                 0660, razer_attr_read_mouse_matrix_brightness,       razer_attr_write_mouse_matrix_brightness);
 static DEVICE_ATTR(mouse_matrix_effect_wave,                0220, NULL,                                           razer_attr_write_mouse_main_matrix_effect_wave);
@@ -3469,9 +3481,11 @@ static int razer_accessory_probe(struct hid_device *hdev, const struct hid_devic
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_serial);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_connected);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_nearby_mice);
+            CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_scan_for_mice);
 
-            /* Kick the dock into 'broadcast nearby mice' mode so the
-             * interface-1 raw_event handler receives '05 37 ...' reports. */
+            /* Kick off one scan at probe so the cache has something to show
+             * before userspace asks; subsequent scans are on-demand via
+             * scan_for_mice (the dock's scan is one-shot, not continuous). */
             razer_mouse_dock_pro_start_scan(dev);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_firmware);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_matrix_brightness);
@@ -3750,6 +3764,7 @@ static void razer_accessory_disconnect(struct hid_device *hdev)
             device_remove_file(&hdev->dev, &dev_attr_mouse_serial);
             device_remove_file(&hdev->dev, &dev_attr_mouse_connected);
             device_remove_file(&hdev->dev, &dev_attr_nearby_mice);
+            device_remove_file(&hdev->dev, &dev_attr_scan_for_mice);
             device_remove_file(&hdev->dev, &dev_attr_mouse_firmware);
             device_remove_file(&hdev->dev, &dev_attr_mouse_matrix_brightness);
             device_remove_file(&hdev->dev, &dev_attr_mouse_matrix_effect_wave);
