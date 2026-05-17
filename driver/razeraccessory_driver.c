@@ -2983,6 +2983,24 @@ static ssize_t razer_attr_write_mouse_dock_pro_unpair(struct device *dev, struct
     return count;
 }
 
+/*
+ * Tell the dock to scan for nearby Razer mice and emit '05 37 ...' HID input
+ * reports on interface 1.  Per razer_dock_pairing_v2.pcapng, Synapse 4 sends
+ * this as one of its first commands at dock startup; without it the dock
+ * never broadcasts nearby announcements on its own.  Single-byte payload
+ * 0x01 — meaning of other arg values not characterised.  Caller must hold
+ * the dock's interface-0 device (only that interface can carry feature
+ * reports via razer_send_payload).
+ */
+static void razer_mouse_dock_pro_start_scan(struct razer_accessory_device *device)
+{
+    struct razer_report request = get_razer_report(0x00, 0x46, 0x01);
+    struct razer_report response = {0};
+    request.arguments[0] = 0x01;
+    request.transaction_id.id = 0x3F;
+    razer_send_payload(device, &request, &response);
+}
+
 /**
  * Set up the device driver files
 
@@ -3451,6 +3469,10 @@ static int razer_accessory_probe(struct hid_device *hdev, const struct hid_devic
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_serial);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_connected);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_nearby_mice);
+
+            /* Kick the dock into 'broadcast nearby mice' mode so the
+             * interface-1 raw_event handler receives '05 37 ...' reports. */
+            razer_mouse_dock_pro_start_scan(dev);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_firmware);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_matrix_brightness);
             CREATE_DEVICE_FILE(&hdev->dev, &dev_attr_mouse_matrix_effect_wave);
