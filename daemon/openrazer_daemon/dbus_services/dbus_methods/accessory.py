@@ -80,22 +80,27 @@ def pair_any_nearby_mouse(self):
     sees.  Convenience method for a one-click "scan and pair" UX where the
     caller does not need to know the PID upfront.
 
+    The mouse must be powered on and awake; no hardware pairing-mode button
+    is needed.  The dock's scan window takes ~10 s to surface unpaired mice
+    (per the v2 capture), so we poll the kernel cache for up to ~12 s before
+    giving up.  Already-paired-and-active mice show up in the cache
+    immediately.
+
     :return: PID of the mouse that was paired, or "" if none were in range
     :rtype: str
     """
     self.logger.debug("DBus call pair_any_nearby_mouse")
 
     scan_for_nearby_mice(self)
-    # Dock typically emits its first announcement within ~5 ms of the scan
-    # request (per v2 capture); 500 ms is generous and bounded.
-    time.sleep(0.5)
 
-    pids = get_nearby_mice(self)
-    if not pids:
-        return ''
+    for _ in range(24):
+        pids = get_nearby_mice(self)
+        if pids:
+            set_mouse_dock_pro_pair(self, pids[0])
+            return pids[0]
+        time.sleep(0.5)
 
-    set_mouse_dock_pro_pair(self, pids[0])
-    return pids[0]
+    return ''
 
 
 @endpoint('razer.device.misc.mug', 'isMugPresent', out_sig='b')
