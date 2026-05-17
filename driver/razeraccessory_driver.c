@@ -2994,17 +2994,22 @@ static ssize_t razer_attr_write_mouse_dock_pro_unpair(struct device *dev, struct
  */
 static void razer_mouse_dock_pro_start_scan(struct razer_accessory_device *device)
 {
-    struct razer_report request = get_razer_report(0x00, 0x46, 0x01);
+    /* Reuses pair_step1 because cmd=0x46 arg=0x01 is the same "begin RF
+     * discovery" command both flows need — the builder ignores its `pid`
+     * argument.  The dock takes ~10 s to surface a result on its '05 37 ...'
+     * input channel (per razer_dock_pairing_v2.pcapng). */
+    struct razer_report request = razer_chroma_misc_set_hyperpolling_wireless_dongle_pair_step1(0);
     struct razer_report response = {0};
-    request.arguments[0] = 0x01;
+    int err;
+
     request.transaction_id.id = 0x3F;
-    razer_send_payload(device, &request, &response);
+    err = razer_send_payload(device, &request, &response);
+    if (err)
+        dev_warn(&device->usb_dev->dev, "nearby-mouse scan trigger failed (err=%d)\n", err);
 }
 
-/* Userspace trigger for the scan command above.  Writing anything to this
- * attribute kicks off a fresh nearby-mice scan; results show up in
- * nearby_mice within a few hundred ms.  Needed because the dock's scan is
- * one-shot, not continuous, so the cache goes stale after a while. */
+/* One-shot trigger; the dock's scan is not continuous so the cache goes
+ * stale after ~30 s.  Daemon writes here before reading nearby_mice. */
 static ssize_t razer_attr_write_scan_for_mice(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);

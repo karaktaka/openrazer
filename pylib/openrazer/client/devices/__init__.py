@@ -604,9 +604,8 @@ class RazerDevice(object):
 
     def scan_for_nearby_mice(self) -> None:
         """
-        Ask the dock to scan for nearby Razer mice.  The dock's scan is
-        one-shot — call this before reading ``nearby_mice`` if you need
-        fresh results.  Results land in the cache within a few hundred ms.
+        Trigger a one-shot dock scan; results land in the cache within a few
+        hundred ms.
 
         :raises NotImplementedError: If function is not supported
         """

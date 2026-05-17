@@ -43,11 +43,8 @@ def set_mouse_dock_pro_unpair(self, pid):
 @endpoint('razer.device.misc', 'scanForNearbyMice')
 def scan_for_nearby_mice(self):
     """
-    Ask the dock to scan for nearby Razer mice.  Discovery announcements
-    arrive on the dock's interrupt endpoint and populate the kernel cache
-    within a few hundred milliseconds.  The dock's scan is one-shot, so
-    callers that want fresh results should call this before reading
-    getNearbyMice.
+    Trigger a one-shot dock scan.  Results land in the kernel cache within
+    a few hundred ms of the request, then age out after 30 s.
     """
     self.logger.debug("DBus call scan_for_nearby_mice")
 
@@ -60,9 +57,8 @@ def get_nearby_mice(self):
     """
     List PIDs of Razer mice the dock has seen on its RF channel recently.
 
-    The driver caches the most recent discovery report and ages it out after
-    30 seconds.  Call scanForNearbyMice first if you want fresh results — the
-    dock does not beacon continuously.
+    The dock does not beacon continuously, so callers wanting fresh results
+    should invoke scanForNearbyMice first and wait briefly.
 
     :return: list of 4-hex-digit mouse PID strings (e.g. ["00ab"])
     :rtype: list[str]
@@ -77,14 +73,13 @@ def get_nearby_mice(self):
 def pair_any_nearby_mouse(self):
     """
     Trigger a fresh scan, wait for results, and pair the first mouse the dock
-    sees.  Convenience method for a one-click "scan and pair" UX where the
-    caller does not need to know the PID upfront.
+    sees.  Convenience for a one-click "scan and pair" UX where the caller
+    doesn't know the mouse PID upfront.
 
-    The mouse must be powered on and awake; no hardware pairing-mode button
-    is needed.  The dock's scan window takes ~10 s to surface unpaired mice
-    (per the v2 capture), so we poll the kernel cache for up to ~12 s before
-    giving up.  Already-paired-and-active mice show up in the cache
-    immediately.
+    The mouse must be powered on and awake.  The dock's scan window takes
+    ~10 s to surface unpaired mice (per the v2 capture), so we poll the
+    kernel cache for up to ~12 s before giving up.  Already-active mice show
+    up in the cache immediately and we return right away.
 
     :return: PID of the mouse that was paired, or "" if none were in range
     :rtype: str
@@ -93,8 +88,10 @@ def pair_any_nearby_mouse(self):
 
     scan_for_nearby_mice(self)
 
+    cache_path = self.get_driver_path('nearby_mice')
     for _ in range(24):
-        pids = get_nearby_mice(self)
+        with open(cache_path, 'r') as driver_file:
+            pids = driver_file.read().split()
         if pids:
             set_mouse_dock_pro_pair(self, pids[0])
             return pids[0]
