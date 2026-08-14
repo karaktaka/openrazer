@@ -1681,6 +1681,15 @@ class RazerCobraProWireless(RazerCobraProWired):
     USB_PID = 0x00B0
 
 
+class RazerCobraProDocked(RazerMouseDocked, RazerCobraProWireless):
+    """
+    Class for the Razer Cobra Pro accessed via the Mouse Dock Pro.
+    """
+
+    WIRELESS_PID = RazerCobraProWireless.USB_PID
+    DEVICE_NAME = "Razer Cobra Pro (Docked)"
+
+
 class RazerDeathAdderV3(__RazerDevice):
     """
     Class for the Razer DeathAdder V3
