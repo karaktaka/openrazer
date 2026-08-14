@@ -2149,6 +2149,19 @@ class RazerViperV3ProWireless(RazerViperV3ProWired):
     POLL_RATES = [125, 500, 1000, 2000, 4000, 8000]
 
 
+class RazerViperV3ProDocked(RazerMouseDocked, RazerViperV3ProWireless):
+    """
+    Class for the Razer Viper V3 Pro accessed via the Mouse Dock Pro.
+    """
+
+    WIRELESS_PID = RazerViperV3ProWireless.USB_PID
+    DEVICE_NAME = "Razer Viper V3 Pro (Docked)"
+
+    # Wireless.METHODS adds the standalone dongle's own indicator LED, not
+    # applicable when docked - use Wired's METHODS instead.
+    METHODS = RazerViperV3ProWired.METHODS
+
+
 class RazerDeathAdderV3HyperSpeedWired(__RazerDevice):
     """
     Class for the Razer DeathAdder V3 HyperSpeed (Wired)
