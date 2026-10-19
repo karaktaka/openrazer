@@ -120,6 +120,8 @@ class RazerDaemon(DBusService):
         self._init_screensaver_monitor()
 
         self._razer_devices = DeviceCollection()
+        # Serializes _razer_devices and persistence mutation across the udev, dock monitor and autosave threads
+        self._device_lock = threading.RLock()
         self._load_devices(first_run=True)
 
         # Add DBus methods
@@ -241,7 +243,8 @@ class RazerDaemon(DBusService):
             files = self._arm_dock_mouse_notifications()
             try:
                 try:
-                    self._check_dock_mouse_state()
+                    with self._device_lock:
+                        self._check_dock_mouse_state()
                 except Exception:
                     self.logger.exception("Error in dock mouse monitor")
                 self._wait_for_dock_mouse_event(files)
@@ -360,16 +363,19 @@ class RazerDaemon(DBusService):
 
     def _remove_dock_child_device(self, child_id):
         try:
-            # The dock reports the mouse gone, so reading its DPI over RF
-            # would only time out.
-            self._teardown_device(self._razer_devices[child_id], read_hardware=False)
-            parent_id = child_id.rsplit(':mouse', 1)[0]
-            parent = self._razer_devices[parent_id]
+            child = self._razer_devices[child_id]
+        except IndexError:
+            return
+        # The dock reports the mouse gone, so reading its DPI over RF
+        # would only time out.
+        self._teardown_device(child, read_hardware=False)
+        try:
+            parent = self._razer_devices[child_id.rsplit(':mouse', 1)[0]]
             if child_id in parent.child_ids:
                 parent.child_ids.remove(child_id)
-            self.device_removed()
-        except (IndexError, KeyError):
+        except IndexError:
             pass
+        self.device_removed()
 
     def _init_signals(self):
         """
@@ -469,6 +475,10 @@ class RazerDaemon(DBusService):
         if not persistence_file:
             return
 
+        with self._device_lock:
+            self._write_persistence(persistence_file)
+
+    def _write_persistence(self, persistence_file):
         self.logger.debug('Writing persistence config')
 
         for device in self._razer_devices:
@@ -804,14 +814,16 @@ class RazerDaemon(DBusService):
                 t = threading.Thread(target=self._collecting_udev_method, args=(device,))
                 t.start()
         elif device.action == 'remove':
-            self._remove_device(device)
+            with self._device_lock:
+                self._remove_device(device)
 
     def _collecting_udev_method(self, device):
         time.sleep(2)  # delay to let udev add all devices that we want
         # Sort the devices
         self._collecting_udev_devices.sort(key=lambda x: x.sys_path, reverse=True)
         for d in self._collecting_udev_devices:
-            self._add_device(d)
+            with self._device_lock:
+                self._add_device(d)
         self._collecting_udev = False
 
     def run(self):

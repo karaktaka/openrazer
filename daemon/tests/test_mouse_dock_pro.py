@@ -5,6 +5,7 @@
 import configparser
 from pathlib import Path
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -136,6 +137,7 @@ class DockLifecycleTest(unittest.TestCase):
         self.daemon.device_added = Mock()
         self.daemon.device_removed = Mock()
         self.daemon.write_persistence = Mock()
+        self.daemon._device_lock = threading.RLock()
         self.dock_id = '0003:1532:00A4.0001'
         self.child_id = self.dock_id + ':mouse'
         self.dock = object.__new__(RazerMouseDockPro)
@@ -257,6 +259,31 @@ class DockLifecycleTest(unittest.TestCase):
         self.old_mouse.close.assert_not_called()
         self.daemon.device_removed.assert_not_called()
 
+    def test_remove_emits_device_removed_once_and_clears_parent_child_ids(self):
+        self.daemon._remove_dock_child_device(self.child_id)
+        self.assertNotIn(self.child_id, self.daemon._razer_devices)
+        self.assertEqual(self.daemon._razer_devices[self.dock_id].child_ids, [])
+        self.daemon.device_removed.assert_called_once_with()
+
+    def test_remove_emits_device_removed_when_parent_is_already_gone(self):
+        del self.daemon._razer_devices[self.dock_id]
+        self.daemon._remove_dock_child_device(self.child_id)
+        self.assertNotIn(self.child_id, self.daemon._razer_devices)
+        self.old_mouse.close.assert_called_once_with(read_hardware=False)
+        self.daemon.device_removed.assert_called_once_with()
+
+    def test_remove_of_absent_child_emits_nothing(self):
+        self.daemon._remove_dock_child_device(self.dock_id + ':other:mouse')
+        self.daemon.device_removed.assert_not_called()
+
+    def test_teardown_persistence_write_reenters_the_device_lock(self):
+        self.daemon.write_persistence = types.MethodType(RazerDaemon.write_persistence, self.daemon)
+        self.daemon._write_persistence = Mock()
+        self.daemon._persistence_file = 'persistence.conf'
+        with self.daemon._device_lock:
+            self.daemon._remove_dock_child_device(self.child_id)
+        self.daemon._write_persistence.assert_called_once_with('persistence.conf')
+
     def test_two_unavailable_samples_remove_child_and_parent_reference(self):
         self.dock.get_active_mouse_identity.return_value = None
         self.daemon._check_dock_mouse_state()
@@ -317,6 +344,7 @@ class DockRestoreTest(unittest.TestCase):
         daemon = object.__new__(RazerDaemon)
         daemon.logger = Mock()
         daemon._persistence = self.mouse.persistence
+        daemon._device_lock = threading.RLock()
         daemon._razer_devices = DeviceCollection()
         daemon._razer_devices.add('dock:mouse', self.mouse.storage_name, self.mouse)
         persistence_path = self.path / 'persistence.conf'
