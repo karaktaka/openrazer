@@ -206,6 +206,57 @@ class DockLifecycleTest(unittest.TestCase):
         self.daemon._check_dock_mouse_state()
         self.dock.get_active_mouse_identity.assert_called_with(expected=None)
 
+    def add_second_dock(self):
+        dock_id = '0003:1532:00A4.0002'
+        dock = object.__new__(RazerMouseDockPro)
+        dock._is_closed = True
+        dock._device_path = self.tmp.name
+        dock.register_parent = Mock()
+        dock.is_mouse_connected = Mock(return_value=False)
+        dock.get_active_mouse_identity = Mock(return_value=None)
+        self.daemon._razer_devices.add(dock_id, 'DOCKSERIAL2', dock)
+        return dock_id, dock
+
+    def test_malformed_paired_slots_keeps_child_and_does_not_stop_other_docks(self):
+        _, dock2 = self.add_second_dock()
+        self.dock.get_active_mouse_identity.side_effect = ValueError('not enough values to unpack')
+        self.daemon._dock_mouse_pending[self.dock_id] = None
+        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state()
+        self.assertIn(self.child_id, self.daemon._razer_devices)
+        self.assertEqual(self.daemon._dock_mouse_pending, {})
+        self.assertEqual(dock2.is_mouse_connected.call_count, 2)
+        self.old_mouse.close.assert_not_called()
+        self.daemon.logger.exception.assert_not_called()
+
+    def test_unexpected_error_in_one_dock_does_not_stop_other_docks(self):
+        _, dock2 = self.add_second_dock()
+        self.dock.is_mouse_connected.side_effect = TypeError('boom')
+        self.daemon._check_dock_mouse_state()
+        self.daemon.logger.exception.assert_called_once()
+        dock2.is_mouse_connected.assert_called_once_with()
+        self.assertIn(self.child_id, self.daemon._razer_devices)
+
+    def test_failing_pending_restore_does_not_stop_loop(self):
+        _, dock2 = self.add_second_dock()
+        self.old_mouse.retry_pending_restore.side_effect = TypeError('boom')
+        self.daemon._check_dock_mouse_state()
+        self.old_mouse.update_dpi_from_report.assert_called_once_with(None)
+        self.daemon.logger.exception.assert_called_once()
+        dock2.is_mouse_connected.assert_called_once_with()
+        self.assertIn(self.child_id, self.daemon._razer_devices)
+
+    def test_busy_status_read_with_child_clears_pending_and_keeps_child(self):
+        self.dock.get_active_mouse_identity.return_value = None
+        self.daemon._check_dock_mouse_state()
+        self.assertEqual(self.daemon._dock_mouse_pending, {self.dock_id: None})
+        self.dock.is_mouse_connected.side_effect = OSError(16, 'Device or resource busy')
+        self.daemon._check_dock_mouse_state()
+        self.assertEqual(self.daemon._dock_mouse_pending, {})
+        self.assertIn(self.child_id, self.daemon._razer_devices)
+        self.old_mouse.close.assert_not_called()
+        self.daemon.device_removed.assert_not_called()
+
     def test_two_unavailable_samples_remove_child_and_parent_reference(self):
         self.dock.get_active_mouse_identity.return_value = None
         self.daemon._check_dock_mouse_state()

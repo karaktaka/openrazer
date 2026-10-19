@@ -291,54 +291,63 @@ class RazerDaemon(DBusService):
             razer_device = device_wrapper.dbus
             if not isinstance(razer_device, RazerMouseDockPro):
                 continue
-
-            child_id = device_id + ':mouse'
-            child_present = child_id in self._razer_devices
-            current = None
-            if child_present:
-                child = self._razer_devices[child_id].dbus
-                current = child.WIRELESS_PID, child.get_serial()
-            # A same-PID mouse swap needs a pair cycle, which drops the link
-            # state and is observed as a transition, so the RF serial read is
-            # only needed while a change is pending.
-            expected = current if device_id not in self._dock_mouse_pending else None
             try:
-                connected = razer_device.is_mouse_connected()
-                identity = razer_device.get_active_mouse_identity(expected=expected) if connected else None
-            except OSError:
-                # A busy RF control channel does not establish a disconnect.
-                # It also interrupts the sequence of matching observations.
-                self._dock_mouse_pending.pop(device_id, None)
-                self.logger.debug("Dock mouse status unavailable for %s", device_id, exc_info=True)
-                continue
+                self._check_dock_mouse(device_id, razer_device)
+            except Exception:
+                self.logger.exception("Error checking dock mouse state for %s", device_id)
 
-            if identity == current:
-                self._dock_mouse_pending.pop(device_id, None)
-                if child_present:
-                    child.update_dpi_from_report(child.read_reported_dpi())
-                    child.retry_pending_restore()
-                continue
+    def _check_dock_mouse(self, device_id, razer_device):
+        child_id = device_id + ':mouse'
+        child_present = child_id in self._razer_devices
+        current = None
+        if child_present:
+            child = self._razer_devices[child_id].dbus
+            current = child.WIRELESS_PID, child.get_serial()
+        # A same-PID mouse swap needs a pair cycle, which drops the link
+        # state and is observed as a transition, so the RF serial read is
+        # only needed while a change is pending.
+        expected = current if device_id not in self._dock_mouse_pending else None
+        try:
+            connected = razer_device.is_mouse_connected()
+            identity = razer_device.get_active_mouse_identity(expected=expected) if connected else None
+        except (OSError, ValueError):
+            # A busy RF control channel or a malformed status token does not
+            # establish a disconnect. It also interrupts the sequence of
+            # matching observations.
+            self._dock_mouse_pending.pop(device_id, None)
+            self.logger.debug("Dock mouse status unavailable for %s", device_id, exc_info=True)
+            return
 
-            # Require two matching observations before a lifecycle change;
-            # event-driven checks repeat after one second while pending.
-            if device_id not in self._dock_mouse_pending or self._dock_mouse_pending[device_id] != identity:
-                self._dock_mouse_pending[device_id] = identity
-                continue
-
+        if identity == current:
             self._dock_mouse_pending.pop(device_id, None)
             if child_present:
-                self.logger.info("Mouse identity changed or disconnected from dock %s", device_id)
-                self._remove_dock_child_device(child_id)
-            if identity is not None:
-                self.logger.info("Mouse connected to dock %s", device_id)
                 try:
-                    self._add_child_devices(device_id, razer_device._device_path, len(self._razer_devices),
-                                            razer_device, expected_identity=identity)
+                    child.update_dpi_from_report(child.read_reported_dpi())
+                    child.retry_pending_restore()
                 except Exception:
-                    self.logger.exception("Failed to add dock %s's mouse child device", device_id)
-                    continue
-                if child_id in self._razer_devices:
-                    self.device_added()
+                    self.logger.exception("Error updating docked mouse %s", child_id)
+            return
+
+        # Require two matching observations before a lifecycle change;
+        # event-driven checks repeat after one second while pending.
+        if device_id not in self._dock_mouse_pending or self._dock_mouse_pending[device_id] != identity:
+            self._dock_mouse_pending[device_id] = identity
+            return
+
+        self._dock_mouse_pending.pop(device_id, None)
+        if child_present:
+            self.logger.info("Mouse identity changed or disconnected from dock %s", device_id)
+            self._remove_dock_child_device(child_id)
+        if identity is not None:
+            self.logger.info("Mouse connected to dock %s", device_id)
+            try:
+                self._add_child_devices(device_id, razer_device._device_path, len(self._razer_devices),
+                                        razer_device, expected_identity=identity)
+            except Exception:
+                self.logger.exception("Failed to add dock %s's mouse child device", device_id)
+                return
+            if child_id in self._razer_devices:
+                self.device_added()
 
     def _teardown_device(self, device, read_hardware=True):
         device.dbus.close(read_hardware=read_hardware)
