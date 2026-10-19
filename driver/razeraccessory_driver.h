@@ -120,9 +120,9 @@ struct razer_accessory_device {
 
     /*
      * Set to 1 while a pair or unpair sequence is in progress.  The
-     * mouse_connected sysfs handler returns 0 immediately when this flag is
-     * set so the daemon's monitor loop cannot send RF-relay battery GETs that
-     * would disrupt the dock's RF state machine mid-sequence.
+     * mouse_connected sysfs handler returns -EBUSY while it is set, so the
+     * daemon treats the state as unavailable rather than as a disconnect and
+     * sends no RF-relay commands mid-sequence.
      */
     atomic_t pairing_busy;
 

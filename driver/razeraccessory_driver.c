@@ -3219,7 +3219,7 @@ static ssize_t razer_attr_read_mouse_connected(struct device *dev, struct device
     int err;
 
     if (atomic_read(&device->pairing_busy))
-        return sysfs_emit(buf, "0\n");
+        return -EBUSY;
 
     /* The '05 09' link report leads the heartbeat below by up to ~1 s, so
      * prefer it once the dock has sent one. */
