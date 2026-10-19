@@ -189,27 +189,39 @@ retry:
  * With quiet_unsupported set, a "not supported" reply returns -ENOTSUPP
  * without logging, so callers can probe which command family the docked
  * mouse speaks and fall back silently.
+ *
+ * A "busy" reply is retried a few times with the lock released, then
+ * returned as -EBUSY so callers can tell a busy RF channel from a lost link.
  */
 static int __must_check razer_dock_send_mouse_payload_ext(struct razer_accessory_device *device, struct razer_report *request, struct razer_report *response, bool quiet_unsupported)
 {
+    int attempt;
     int err;
 
     request->transaction_id.id = 0x1F;
     request->crc = razer_calculate_crc(request);
 
-    mutex_lock(&device->lock);
-    err = razer_get_usb_response(device->hdev, 0x00, request, 0x00, response, RAZER_ACCESSORY_MOUSE_WAIT_MIN_US);
-    mutex_unlock(&device->lock);
-    if (err) {
-        print_erroneous_report(device->hdev, response, "Invalid Mouse Report Length");
-        return err;
-    }
+    for (attempt = 0; attempt < 3; attempt++) {
+        if (attempt)
+            fsleep(10000);
 
-    if (response->remaining_packets != request->remaining_packets ||
-        response->command_class != request->command_class ||
-        response->command_id.id != request->command_id.id) {
-        print_erroneous_report(device->hdev, response, "Mouse response doesn't match request");
-        return -EIO;
+        mutex_lock(&device->lock);
+        err = razer_get_usb_response(device->hdev, 0x00, request, 0x00, response, RAZER_ACCESSORY_MOUSE_WAIT_MIN_US);
+        mutex_unlock(&device->lock);
+        if (err) {
+            print_erroneous_report(device->hdev, response, "Invalid Mouse Report Length");
+            return err;
+        }
+
+        if (response->remaining_packets != request->remaining_packets ||
+            response->command_class != request->command_class ||
+            response->command_id.id != request->command_id.id) {
+            print_erroneous_report(device->hdev, response, "Mouse response doesn't match request");
+            return -EIO;
+        }
+
+        if (response->status != RAZER_CMD_BUSY)
+            break;
     }
 
     switch (response->status) {
