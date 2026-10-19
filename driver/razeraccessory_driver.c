@@ -2973,48 +2973,6 @@ static ssize_t razer_attr_write_mouse_scroll_led_brightness(struct device *dev, 
     return razer_attr_write_mouse_led_brightness(dev, attr, buf, count, SCROLL_WHEEL_LED);
 }
 
-/*
- * The Naga Pro / Naga V2 Pro's own (non-dock) driver sends their unprefixed
- * "main" matrix effect (thumbgrid) through different command families than
- * every other docked mouse (razer_chroma_extended_matrix_effect_*, ZERO_LED):
- * the Naga Pro uses razer_chroma_mouse_extended_matrix_effect_* (BACKLIGHT_LED),
- * the Naga V2 Pro uses razer_naga_trinity_effect_* for none/static/spectrum/
- * breath and the BACKLIGHT_LED family for reactive - see razermouse_driver.c's
- * matrix_effect_* and matrix_custom_frame handlers. The generic
- * mouse_matrix_effect_* relay below only covers the generic family, so callers
- * need to special-case the Nagas.
- */
-static unsigned short razer_dock_pro_paired_pid(struct razer_accessory_device *device)
-{
-    unsigned short pid = 0;
-    unsigned long flags;
-
-    if (!device->shared)
-        return 0;
-
-    spin_lock_irqsave(&device->shared->nearby_lock, flags);
-    pid = device->shared->paired_pid;
-    spin_unlock_irqrestore(&device->shared->nearby_lock, flags);
-
-    return pid;
-}
-
-static bool razer_dock_pro_paired_mouse_is_naga_v2(struct razer_accessory_device *device)
-{
-    return razer_dock_pro_paired_pid(device) == USB_DEVICE_ID_RAZER_NAGA_V2_PRO_WIRELESS;
-}
-
-static bool razer_dock_pro_paired_mouse_is_naga(struct razer_accessory_device *device)
-{
-    switch (razer_dock_pro_paired_pid(device)) {
-    case USB_DEVICE_ID_RAZER_NAGA_PRO_WIRELESS:
-    case USB_DEVICE_ID_RAZER_NAGA_V2_PRO_WIRELESS:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static ssize_t razer_attr_write_mouse_matrix_effect_wave(struct device *dev, struct device_attribute *attr, const char *buf, size_t count, unsigned char led_id)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
@@ -3275,10 +3233,40 @@ static ssize_t razer_attr_read_mouse_connected(struct device *dev, struct device
 /*
  * 0xbf reports a slot count followed by three bytes per slot: availability,
  * PID high byte and PID low byte. A stored PID remains present when its
- * availability flag is zero. Only slot 1 is a characterized relay target.
+ * availability flag is zero. Only slot 1 is a characterized relay target,
+ * so its PID refreshes the shared paired_pid cache.
  */
-static int razer_dock_pro_query_slots(struct razer_accessory_device *device, struct razer_report *response)
+static unsigned short razer_dock_pro_slot_pid(const struct razer_report *response, size_t slot_index)
 {
+    size_t offset = 1 + 3 * slot_index;
+
+    return ((unsigned short)response->arguments[offset + 1] << 8) | response->arguments[offset + 2];
+}
+
+static unsigned short razer_dock_pro_slot1_pid(const struct razer_report *response)
+{
+    unsigned short pid;
+
+    if (response->arguments[0] < 1)
+        return 0;
+
+    pid = razer_dock_pro_slot_pid(response, 0);
+    return pid == 0xffff ? 0 : pid;
+}
+
+static void razer_set_shared_paired_pid(struct razer_accessory_device *device, unsigned short pid)
+{
+    unsigned long flags;
+    if (!device->shared)
+        return;
+    spin_lock_irqsave(&device->shared->nearby_lock, flags);
+    device->shared->paired_pid = pid;
+    spin_unlock_irqrestore(&device->shared->nearby_lock, flags);
+}
+
+static int razer_dock_pro_query_slots(struct razer_accessory_device *device, struct razer_report *response, unsigned short *slot1_pid)
+{
+    unsigned short pid;
     struct razer_report request = get_razer_report(0x00, 0xbf, 0x1f);
     int err;
 
@@ -3298,6 +3286,11 @@ static int razer_dock_pro_query_slots(struct razer_accessory_device *device, str
     if (response->data_size < 1 + 3 * response->arguments[0])
         return -EIO;
 
+    pid = razer_dock_pro_slot1_pid(response);
+    razer_set_shared_paired_pid(device, pid);
+    if (slot1_pid)
+        *slot1_pid = pid;
+
     return 0;
 }
 
@@ -3306,11 +3299,58 @@ static unsigned short razer_dock_pro_query_paired_pid(struct razer_accessory_dev
     struct razer_report response = {0};
     unsigned short pid;
 
-    if (razer_dock_pro_query_slots(device, &response) || response.arguments[0] < 1)
+    if (razer_dock_pro_query_slots(device, &response, &pid))
         return 0;
 
-    pid = ((unsigned short)response.arguments[2] << 8) | response.arguments[3];
-    return pid == 0xffff ? 0 : pid;
+    return pid;
+}
+
+/*
+ * The Naga Pro / Naga V2 Pro's own (non-dock) driver sends their unprefixed
+ * "main" matrix effect (thumbgrid) through different command families than
+ * every other docked mouse (razer_chroma_extended_matrix_effect_*, ZERO_LED):
+ * the Naga Pro uses razer_chroma_mouse_extended_matrix_effect_* (BACKLIGHT_LED),
+ * the Naga V2 Pro uses razer_naga_trinity_effect_* for none/static/spectrum/
+ * breath and the BACKLIGHT_LED family for reactive - see razermouse_driver.c's
+ * matrix_effect_* and matrix_custom_frame handlers. The generic
+ * mouse_matrix_effect_* relay below only covers the generic family, so callers
+ * need to special-case the Nagas.
+ *
+ * Takes device->lock when the paired_pid cache is empty, so callers must not
+ * hold it. Each handler looks the PID up once and tests the local value.
+ */
+static unsigned short razer_dock_pro_paired_pid(struct razer_accessory_device *device)
+{
+    unsigned short pid = 0;
+    unsigned long flags;
+
+    if (!device->shared)
+        return 0;
+
+    spin_lock_irqsave(&device->shared->nearby_lock, flags);
+    pid = device->shared->paired_pid;
+    spin_unlock_irqrestore(&device->shared->nearby_lock, flags);
+
+    if (!pid && !atomic_read(&device->pairing_busy))
+        pid = razer_dock_pro_query_paired_pid(device);
+
+    return pid;
+}
+
+static bool razer_pid_is_naga_v2(unsigned short pid)
+{
+    return pid == USB_DEVICE_ID_RAZER_NAGA_V2_PRO_WIRELESS;
+}
+
+static bool razer_pid_is_naga(unsigned short pid)
+{
+    switch (pid) {
+    case USB_DEVICE_ID_RAZER_NAGA_PRO_WIRELESS:
+    case USB_DEVICE_ID_RAZER_NAGA_V2_PRO_WIRELESS:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static ssize_t razer_attr_read_paired_pid(struct device *dev, struct device_attribute *attr, char *buf)
@@ -3355,18 +3395,15 @@ static ssize_t razer_attr_read_paired_slots(struct device *dev, struct device_at
     ssize_t written = 0;
     int err;
 
-    err = razer_dock_pro_query_slots(device, &response);
+    err = razer_dock_pro_query_slots(device, &response, NULL);
     if (err)
         return err;
 
     count = response.arguments[0];
     for (i = 0; i < count; i++) {
-        size_t offset = 1 + 3 * i;
-        unsigned short pid = ((unsigned short)response.arguments[offset + 1] << 8) |
-                             response.arguments[offset + 2];
-
         written += sysfs_emit_at(buf, written, "%s%zu:%u:%04x", i ? " " : "",
-                                 i + 1, response.arguments[offset], pid);
+                                 i + 1, response.arguments[1 + 3 * i],
+                                 razer_dock_pro_slot_pid(&response, i));
     }
 
     return written + sysfs_emit_at(buf, written, "\n");
@@ -3426,11 +3463,12 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_wave(struct device *dev
 static ssize_t razer_attr_write_mouse_main_matrix_effect_static(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
+    unsigned short paired_pid = razer_dock_pro_paired_pid(device);
     struct razer_report request = {0};
     struct razer_report response = {0};
     int err;
 
-    if (razer_dock_pro_paired_mouse_is_naga(device)) {
+    if (razer_pid_is_naga(paired_pid)) {
         if (count != 3) {
             printk(KERN_WARNING "razeraccessory: Static mode only accepts RGB (3byte)\n");
             return -EINVAL;
@@ -3457,12 +3495,13 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_static(struct device *d
 static ssize_t razer_attr_write_mouse_main_matrix_effect_spectrum(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
+    unsigned short paired_pid = razer_dock_pro_paired_pid(device);
     struct razer_report request = {0};
     struct razer_report response = {0};
     int err;
 
-    if (razer_dock_pro_paired_mouse_is_naga(device)) {
-        if (razer_dock_pro_paired_mouse_is_naga_v2(device))
+    if (razer_pid_is_naga(paired_pid)) {
+        if (razer_pid_is_naga_v2(paired_pid))
             request = razer_naga_trinity_effect_spectrum();
         else
             request = razer_chroma_mouse_extended_matrix_effect_spectrum(VARSTORE, BACKLIGHT_LED);
@@ -3479,11 +3518,12 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_spectrum(struct device 
 static ssize_t razer_attr_write_mouse_main_matrix_effect_none(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
+    unsigned short paired_pid = razer_dock_pro_paired_pid(device);
     struct razer_report request = {0};
     struct razer_report response = {0};
     int err;
 
-    if (razer_dock_pro_paired_mouse_is_naga_v2(device)) {
+    if (razer_pid_is_naga_v2(paired_pid)) {
         request = razer_naga_trinity_effect_none();
         err = razer_dock_send_mouse_payload(device, &request, &response);
         if (err)
@@ -3498,11 +3538,12 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_none(struct device *dev
 static ssize_t razer_attr_write_mouse_main_matrix_effect_breath(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
+    unsigned short paired_pid = razer_dock_pro_paired_pid(device);
     struct razer_report request = {0};
     struct razer_report response = {0};
     int err;
 
-    if (razer_dock_pro_paired_mouse_is_naga_v2(device)) {
+    if (razer_pid_is_naga_v2(paired_pid)) {
         switch (count) {
         case 3:
             request = razer_naga_trinity_effect_breathing_single((struct razer_rgb*)&buf[0]);
@@ -3522,7 +3563,7 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_breath(struct device *d
         return count;
     }
 
-    if (razer_dock_pro_paired_mouse_is_naga(device)) {
+    if (razer_pid_is_naga(paired_pid)) {
         switch (count) {
         case 3:
             request = razer_chroma_mouse_extended_matrix_effect_breathing_single(VARSTORE, BACKLIGHT_LED, (struct razer_rgb*)&buf[0]);
@@ -3548,12 +3589,13 @@ static ssize_t razer_attr_write_mouse_main_matrix_effect_breath(struct device *d
 static ssize_t razer_attr_write_mouse_main_matrix_effect_reactive(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
 {
     struct razer_accessory_device *device = dev_get_drvdata(dev);
+    unsigned short paired_pid = razer_dock_pro_paired_pid(device);
     struct razer_report request = {0};
     struct razer_report response = {0};
     unsigned char speed;
     int err;
 
-    if (razer_dock_pro_paired_mouse_is_naga(device)) {
+    if (razer_pid_is_naga(paired_pid)) {
         if (count != 4) {
             dev_warn(dev, "razeraccessory: Reactive only accepts Speed, RGB (4byte)\n");
             return -EINVAL;
@@ -3594,7 +3636,7 @@ static ssize_t razer_attr_write_mouse_matrix_custom_frame(struct device *dev, st
     unsigned char row_id, start_col, stop_col;
     size_t offset = 0;
     size_t row_length;
-    bool is_naga = razer_dock_pro_paired_mouse_is_naga(device);
+    bool is_naga = razer_pid_is_naga(razer_dock_pro_paired_pid(device));
     int err;
 
     while(offset < count) {
@@ -3635,16 +3677,6 @@ static ssize_t razer_attr_write_mouse_matrix_custom_frame(struct device *dev, st
     return count;
 }
 
-static void razer_set_shared_paired_pid(struct razer_accessory_device *device, unsigned short pid)
-{
-    unsigned long flags;
-    if (!device->shared)
-        return;
-    spin_lock_irqsave(&device->shared->nearby_lock, flags);
-    device->shared->paired_pid = pid;
-    spin_unlock_irqrestore(&device->shared->nearby_lock, flags);
-}
-
 /* The cached link state and DPI describe the previous pairing (or the time
  * before a host suspend), so drop them until the dock reports again. */
 static void razer_reset_shared_link_state(struct razer_accessory_device *device)
@@ -3666,6 +3698,7 @@ static ssize_t razer_attr_write_mouse_dock_pro_pair(struct device *dev, struct d
     unsigned int pid = (unsigned int)simple_strtoul(buf, NULL, 16);
     struct razer_report request = {0};
     struct razer_report response = {0};
+    bool associated = false;
     int i;
     int err;
 
@@ -3717,17 +3750,18 @@ static ssize_t razer_attr_write_mouse_dock_pro_pair(struct device *dev, struct d
         request = get_razer_report(0x00, 0x86, 0x03);
         request.transaction_id.id = 0xFF;
         err = razer_send_payload(device, &request, &response);
-        if (!err && response.status == RAZER_CMD_SUCCESSFUL)
+        if (!err && response.status == RAZER_CMD_SUCCESSFUL) {
+            associated = true;
             break;
+        }
     }
 
     request = get_razer_report(0x00, 0xb9, 0x01);
     request.transaction_id.id = 0x1F;
     err = razer_send_payload(device, &request, &response);
 
-    /* Cache the PID so paired_pid can return it even before a reboot flushes
-     * the heartbeat path (and as a fallback if the heartbeat carries no PID). */
-    if ((unsigned short)pid != 0)
+    /* Route Naga LED commands correctly until the next heartbeat refreshes slot 1. */
+    if (associated && !err && (unsigned short)pid != 0)
         razer_set_shared_paired_pid(device, (unsigned short)pid);
 
     atomic_set(&device->pairing_busy, 0);

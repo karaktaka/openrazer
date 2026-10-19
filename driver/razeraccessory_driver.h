@@ -74,9 +74,9 @@ struct razer_dock_pro_shared {
     unsigned long nearby_jiffies;
 
     /*
-     * PID of the currently paired mouse, set at pair_step2 and cleared at
-     * unpair.  Used as a fallback by razer_attr_read_paired_pid when the
-     * 0xbf heartbeat response does not carry the PID (e.g. older firmware).
+     * Slot 1 PID from the latest 0xbf heartbeat, pair or unpair, whichever
+     * came last; 0 when empty or not yet known.  Selects the Naga-specific
+     * LED command families for relayed mouse commands.
      * Protected by nearby_lock.
      */
     unsigned short paired_pid;
