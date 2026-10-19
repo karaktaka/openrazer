@@ -294,19 +294,23 @@ class RazerDaemon(DBusService):
 
             child_id = device_id + ':mouse'
             child_present = child_id in self._razer_devices
+            current = None
+            if child_present:
+                child = self._razer_devices[child_id].dbus
+                current = child.WIRELESS_PID, child.get_serial()
+            # A same-PID mouse swap needs a pair cycle, which drops the link
+            # state and is observed as a transition, so the RF serial read is
+            # only needed while a change is pending.
+            expected = current if device_id not in self._dock_mouse_pending else None
             try:
                 connected = razer_device.is_mouse_connected()
-                identity = razer_device.get_active_mouse_identity() if connected else None
+                identity = razer_device.get_active_mouse_identity(expected=expected) if connected else None
             except OSError:
                 # A busy RF control channel does not establish a disconnect.
                 # It also interrupts the sequence of matching observations.
                 self._dock_mouse_pending.pop(device_id, None)
                 self.logger.debug("Dock mouse status unavailable for %s", device_id, exc_info=True)
                 continue
-            current = None
-            if child_present:
-                child = self._razer_devices[child_id].dbus
-                current = child.WIRELESS_PID, child.get_serial()
 
             if identity == current:
                 self._dock_mouse_pending.pop(device_id, None)

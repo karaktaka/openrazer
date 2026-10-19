@@ -75,6 +75,32 @@ class DockIdentityTest(unittest.TestCase):
             (RazerBasiliskV3ProDocked, {'id_suffix': ':mouse', 'serial': 'TESTMOUSE01'}),
         ])
 
+    def test_expected_identity_skips_serial_read_when_slot_pid_unchanged(self):
+        (self.path / 'paired_slots').write_text('1:1:00ab 2:0:ffff\n')
+        self.dock.get_paired_slots = Mock(wraps=self.dock.get_paired_slots)
+        expected = (0x00AB, 'TESTMOUSE01')
+        self.assertFalse((self.path / 'mouse_serial').exists())
+        self.assertEqual(self.dock.get_active_mouse_identity(expected=expected), expected)
+        self.dock.get_paired_slots.assert_called_once_with()
+
+    def test_expected_identity_with_other_pid_or_unavailable_slot_takes_full_path(self):
+        self.dock._get_wireless_pid_registry = Mock(return_value={
+            0x00AB: RazerBasiliskV3ProDocked, 0x00AC: RazerBasiliskV3ProDocked,
+        })
+        expected = (0x00AB, 'TESTMOUSE01')
+        (self.path / 'mouse_serial').write_text('OTHERMOUSE02\n')
+        (self.path / 'paired_slots').write_text('1:1:00ac 2:0:ffff\n')
+        self.assertEqual(self.dock.get_active_mouse_identity(expected=expected), (0x00AC, 'OTHERMOUSE02'))
+        (self.path / 'paired_slots').write_text('1:0:00ab 2:0:ffff\n')
+        self.assertIsNone(self.dock.get_active_mouse_identity(expected=expected))
+
+    def test_full_read_without_expected_still_reads_serial(self):
+        (self.path / 'paired_slots').write_text('1:1:00ab\n')
+        with self.assertRaises(OSError):
+            self.dock.get_active_mouse_identity()
+        (self.path / 'mouse_serial').write_text('TESTMOUSE01\n')
+        self.assertEqual(self.dock.get_active_mouse_identity(), (0x00AB, 'TESTMOUSE01'))
+
     def test_mouse_connected_read_error_is_not_a_disconnect(self):
         with patch('builtins.open', side_effect=OSError(5, 'I/O error')):
             with self.assertRaises(OSError):
@@ -170,6 +196,15 @@ class DockLifecycleTest(unittest.TestCase):
         self.assertIn(self.child_id, self.daemon._razer_devices)
         self.daemon._check_dock_mouse_state()
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
+
+    def test_steady_state_passes_expected_identity_but_pending_does_not(self):
+        self.daemon._check_dock_mouse_state()
+        self.dock.get_active_mouse_identity.assert_called_with(expected=(0x00AB, 'MOUSEOLD'))
+        self.dock.get_active_mouse_identity.return_value = None
+        self.daemon._check_dock_mouse_state()
+        self.assertIn(self.dock_id, self.daemon._dock_mouse_pending)
+        self.daemon._check_dock_mouse_state()
+        self.dock.get_active_mouse_identity.assert_called_with(expected=None)
 
     def test_two_unavailable_samples_remove_child_and_parent_reference(self):
         self.dock.get_active_mouse_identity.return_value = None

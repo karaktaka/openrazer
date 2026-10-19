@@ -152,8 +152,13 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
                 for value in values
                 for slot, available, pid in [value.split(':')]]
 
-    def get_active_mouse_identity(self):
-        """Only slot 1 has a characterized control route; require a real serial."""
+    def get_active_mouse_identity(self, expected=None):
+        """
+        Only slot 1 has a characterized control route; require a real serial.
+
+        If slot 1 is available with the PID of the (pid, serial) tuple in
+        expected, return expected without the RF serial read.
+        """
         slots = self.get_paired_slots()
         if not slots or slots[0][0] != 1 or not slots[0][1]:
             return None
@@ -161,6 +166,8 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
             pid = int(slots[0][2], 16)
             if pid not in self._get_wireless_pid_registry():
                 return None
+            if expected is not None and expected[0] == pid:
+                return expected
             with open(self.get_driver_path("mouse_serial")) as f:
                 serial = f.read().strip()
             confirmed_slots = self.get_paired_slots()
