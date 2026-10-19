@@ -3,6 +3,7 @@
 """Mouse Dock Pro lifecycle and failed RF transaction regressions."""
 
 import configparser
+import errno
 from pathlib import Path
 import tempfile
 import threading
@@ -52,6 +53,21 @@ class DockIdentityTest(unittest.TestCase):
         ])
         self.assertEqual(self.dock.get_child_devices(), [])
 
+    def test_malformed_paired_slots_token_raises_oserror(self):
+        for content in ('1:1', '1:1:00ab:x', 'x:1:00ab', '1:x:00ab', '1:1:00a', '1:1:00zz'):
+            with self.subTest(content=content):
+                (self.path / 'paired_slots').write_text(content + '\n')
+                with self.assertRaises(OSError) as ctx:
+                    self.dock.get_paired_slots()
+                self.assertEqual(ctx.exception.errno, errno.EIO)
+                with self.assertRaises(OSError):
+                    self.dock.get_active_mouse_identity()
+                self.assertEqual(self.dock.get_child_devices(), [])
+
+    def test_unknown_availability_value_parses_as_not_available(self):
+        (self.path / 'paired_slots').write_text('1:2:00ab\n')
+        self.assertEqual(self.dock.get_paired_slots(), [(1, False, '00ab')])
+
     def test_unknown_active_slot_does_not_get_a_guessed_child_class(self):
         (self.path / 'paired_slots').write_text('1:1:1234 2:0:ffff\n')
         (self.path / 'mouse_serial').write_text('TESTMOUSE01\n')
@@ -67,6 +83,12 @@ class DockIdentityTest(unittest.TestCase):
         self.dock.get_paired_slots = Mock(side_effect=[
             [(1, True, '00ab')], [(1, False, '00ab')],
         ])
+        self.assertEqual(self.dock.get_child_devices(), [])
+
+    def test_undecodable_serial_is_no_mouse(self):
+        (self.path / 'paired_slots').write_text('1:1:00ab 2:0:ffff\n')
+        (self.path / 'mouse_serial').write_bytes(b'\xff\xfe\x80TEST\n')
+        self.assertIsNone(self.dock.get_active_mouse_identity())
         self.assertEqual(self.dock.get_child_devices(), [])
 
     def test_known_active_identity_selects_original_basilisk(self):
@@ -140,25 +162,29 @@ class DockLifecycleTest(unittest.TestCase):
         self.daemon._device_lock = threading.RLock()
         self.dock_id = '0003:1532:00A4.0001'
         self.child_id = self.dock_id + ':mouse'
-        self.dock = object.__new__(RazerMouseDockPro)
-        self.dock._is_closed = True
-        self.dock._device_path = self.tmp.name
-        self.dock.register_parent = Mock()
-        self.dock.is_mouse_connected = Mock(return_value=True)
-        self.dock.get_active_mouse_identity = Mock(return_value=(0x00AB, 'MOUSEOLD'))
+        self.dock = self.make_dock(self.dock_id, 'DOCKSERIAL', True, (0x00AB, 'MOUSEOLD'))
         self.dock.get_child_devices = Mock(return_value=[
             (FakeDockedMouse, {'id_suffix': ':mouse', 'serial': 'MOUSENEW'}),
         ])
-        self.daemon._razer_devices.add(self.dock_id, 'DOCKSERIAL', self.dock)
         self.old_mouse = FakeDockedMouse('MOUSEOLD')
         self.daemon._razer_devices.add(self.child_id, 'MOUSEOLD', self.old_mouse)
         self.daemon._razer_devices[self.dock_id].child_ids.append(self.child_id)
 
+    def make_dock(self, dock_id, serial, connected, identity):
+        dock = object.__new__(RazerMouseDockPro)
+        dock._is_closed = True
+        dock._device_path = self.tmp.name
+        dock.register_parent = Mock()
+        dock.is_mouse_connected = Mock(return_value=connected)
+        dock.get_active_mouse_identity = Mock(return_value=identity)
+        self.daemon._razer_devices.add(dock_id, serial, dock)
+        return dock
+
     def test_identity_replacement_requires_two_observations_and_releases_old_serial(self):
         self.dock.get_active_mouse_identity.return_value = (0x00AB, 'MOUSENEW')
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertIs(self.daemon._razer_devices[self.child_id].dbus, self.old_mouse)
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn('MOUSEOLD', self.daemon._razer_devices)
         self.assertEqual(self.daemon._razer_devices[self.child_id].serial, 'MOUSENEW')
         self.assertEqual(self.daemon._razer_devices[self.dock_id].child_ids, [self.child_id])
@@ -169,8 +195,8 @@ class DockLifecycleTest(unittest.TestCase):
 
     def test_one_unavailable_sample_does_not_remove_child_and_stable_identity_retries_restore(self):
         self.dock.get_active_mouse_identity.side_effect = [None, (0x00AB, 'MOUSEOLD')]
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertIn(self.child_id, self.daemon._razer_devices)
         self.assertEqual(self.daemon._dock_mouse_pending, {})
         self.old_mouse.close.assert_not_called()
@@ -180,8 +206,8 @@ class DockLifecycleTest(unittest.TestCase):
 
     def test_link_down_removes_child_without_querying_paired_slots_or_rf(self):
         self.dock.is_mouse_connected.return_value = False
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
         self.dock.get_active_mouse_identity.assert_not_called()
         self.old_mouse.close.assert_called_once_with(read_hardware=False)
@@ -189,42 +215,39 @@ class DockLifecycleTest(unittest.TestCase):
 
     def test_status_error_interrupts_pending_disconnect(self):
         self.dock.is_mouse_connected.side_effect = [False, OSError(16, 'busy'), False, False]
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertEqual(self.daemon._dock_mouse_pending[self.dock_id], None)
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertEqual(self.daemon._dock_mouse_pending, {})
         self.assertIn(self.child_id, self.daemon._razer_devices)
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertIn(self.child_id, self.daemon._razer_devices)
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
 
     def test_steady_state_passes_expected_identity_but_pending_does_not(self):
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.dock.get_active_mouse_identity.assert_called_with(expected=(0x00AB, 'MOUSEOLD'))
         self.dock.get_active_mouse_identity.return_value = None
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertIn(self.dock_id, self.daemon._dock_mouse_pending)
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.dock.get_active_mouse_identity.assert_called_with(expected=None)
+
+    def armed(self):
+        return {device_id for device_id, wrapper in self.daemon._razer_devices.id_items()
+                if isinstance(wrapper.dbus, RazerMouseDockPro)}
 
     def add_second_dock(self):
         dock_id = '0003:1532:00A4.0002'
-        dock = object.__new__(RazerMouseDockPro)
-        dock._is_closed = True
-        dock._device_path = self.tmp.name
-        dock.register_parent = Mock()
-        dock.is_mouse_connected = Mock(return_value=False)
-        dock.get_active_mouse_identity = Mock(return_value=None)
-        self.daemon._razer_devices.add(dock_id, 'DOCKSERIAL2', dock)
-        return dock_id, dock
+        return dock_id, self.make_dock(dock_id, 'DOCKSERIAL2', False, None)
 
     def test_malformed_paired_slots_keeps_child_and_does_not_stop_other_docks(self):
         _, dock2 = self.add_second_dock()
-        self.dock.get_active_mouse_identity.side_effect = ValueError('not enough values to unpack')
+        self.dock.get_active_mouse_identity.side_effect = OSError(errno.EIO, 'malformed paired_slots: 1:1')
         self.daemon._dock_mouse_pending[self.dock_id] = None
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertIn(self.child_id, self.daemon._razer_devices)
         self.assertEqual(self.daemon._dock_mouse_pending, {})
         self.assertEqual(dock2.is_mouse_connected.call_count, 2)
@@ -234,7 +257,7 @@ class DockLifecycleTest(unittest.TestCase):
     def test_unexpected_error_in_one_dock_does_not_stop_other_docks(self):
         _, dock2 = self.add_second_dock()
         self.dock.is_mouse_connected.side_effect = TypeError('boom')
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.daemon.logger.exception.assert_called_once()
         dock2.is_mouse_connected.assert_called_once_with()
         self.assertIn(self.child_id, self.daemon._razer_devices)
@@ -242,18 +265,19 @@ class DockLifecycleTest(unittest.TestCase):
     def test_failing_pending_restore_does_not_stop_loop(self):
         _, dock2 = self.add_second_dock()
         self.old_mouse.retry_pending_restore.side_effect = TypeError('boom')
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.old_mouse.update_dpi_from_report.assert_called_once_with(None)
-        self.daemon.logger.exception.assert_called_once()
+        self.daemon.logger.exception.assert_called_once_with(
+            "Error checking dock mouse state for %s", self.dock_id)
         dock2.is_mouse_connected.assert_called_once_with()
         self.assertIn(self.child_id, self.daemon._razer_devices)
 
     def test_busy_status_read_with_child_clears_pending_and_keeps_child(self):
         self.dock.get_active_mouse_identity.return_value = None
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertEqual(self.daemon._dock_mouse_pending, {self.dock_id: None})
         self.dock.is_mouse_connected.side_effect = OSError(16, 'Device or resource busy')
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertEqual(self.daemon._dock_mouse_pending, {})
         self.assertIn(self.child_id, self.daemon._razer_devices)
         self.old_mouse.close.assert_not_called()
@@ -272,22 +296,46 @@ class DockLifecycleTest(unittest.TestCase):
         self.old_mouse.close.assert_called_once_with(read_hardware=False)
         self.daemon.device_removed.assert_called_once_with()
 
+    def test_failed_teardown_still_unregisters_child_and_emits_removed_once(self):
+        self.old_mouse.close.side_effect = OSError(errno.ENODEV, 'gone')
+        with self.assertRaises(OSError):
+            self.daemon._remove_dock_child_device(self.child_id)
+        self.assertNotIn(self.child_id, self.daemon._razer_devices)
+        self.old_mouse.remove_from_connection.assert_called_once_with()
+        self.assertEqual(self.daemon._razer_devices[self.dock_id].child_ids, [])
+        self.daemon.device_removed.assert_called_once_with()
+
     def test_remove_of_absent_child_emits_nothing(self):
         self.daemon._remove_dock_child_device(self.dock_id + ':other:mouse')
         self.daemon.device_removed.assert_not_called()
 
     def test_teardown_persistence_write_reenters_the_device_lock(self):
         self.daemon.write_persistence = types.MethodType(RazerDaemon.write_persistence, self.daemon)
-        self.daemon._write_persistence = Mock()
-        self.daemon._persistence_file = 'persistence.conf'
+        for device, name in ((self.dock, 'DOCKSERIAL'), (self.old_mouse, 'MOUSEOLD')):
+            device.storage_name = name
+            device.ZONES = ()
+            device.METHODS = []
+        self.daemon._persistence_file = str(Path(self.tmp.name) / 'persistence.conf')
         with self.daemon._device_lock:
             self.daemon._remove_dock_child_device(self.child_id)
-        self.daemon._write_persistence.assert_called_once_with('persistence.conf')
+        self.assertTrue(Path(self.daemon._persistence_file).is_file())
+
+    def test_event_driven_tick_forces_full_identity_read(self):
+        self.daemon._check_dock_mouse_state({self.dock_id}, self.armed())
+        self.dock.get_active_mouse_identity.assert_called_with(expected=None)
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.dock.get_active_mouse_identity.assert_called_with(expected=(0x00AB, 'MOUSEOLD'))
+
+    def test_unarmed_dock_is_event_driven_on_every_tick(self):
+        self.daemon._check_dock_mouse_state(set(), set())
+        self.dock.get_active_mouse_identity.assert_called_with(expected=None)
+        self.daemon._check_dock_mouse_state(set(), {self.dock_id})
+        self.dock.get_active_mouse_identity.assert_called_with(expected=(0x00AB, 'MOUSEOLD'))
 
     def test_two_unavailable_samples_remove_child_and_parent_reference(self):
         self.dock.get_active_mouse_identity.return_value = None
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
         self.assertNotIn('MOUSEOLD', self.daemon._razer_devices)
         self.assertEqual(self.daemon._razer_devices[self.dock_id].child_ids, [])
@@ -299,8 +347,8 @@ class DockLifecycleTest(unittest.TestCase):
         physical_mouse = FakeDockedMouse('MOUSENEW')
         self.daemon._razer_devices.add('physical-mouse', 'MOUSENEW', physical_mouse)
         self.dock.get_active_mouse_identity.return_value = (0x00AB, 'MOUSENEW')
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
         self.assertIs(self.daemon._razer_devices['MOUSENEW'].dbus, physical_mouse)
         self.assertEqual(self.daemon._razer_devices[self.dock_id].child_ids, [])
@@ -308,8 +356,8 @@ class DockLifecycleTest(unittest.TestCase):
 
     def test_identity_change_during_child_discovery_is_not_registered(self):
         self.dock.get_active_mouse_identity.return_value = (0x00AB, 'MOUSEOTHER')
-        self.daemon._check_dock_mouse_state()
-        self.daemon._check_dock_mouse_state()
+        self.daemon._check_dock_mouse_state(set(), self.armed())
+        self.daemon._check_dock_mouse_state(set(), self.armed())
         self.assertNotIn(self.child_id, self.daemon._razer_devices)
         self.assertNotIn('MOUSENEW', self.daemon._razer_devices)
         self.daemon.device_added.assert_not_called()

@@ -237,19 +237,22 @@ class RazerDaemon(DBusService):
         t.start()
 
     def _dock_mouse_monitor_loop(self):
+        event_device_ids = None
         while True:
             # Arm before sampling so a link change during the check still
             # wakes the wait below.
-            files = self._arm_dock_mouse_notifications()
+            files, armed_device_ids = self._arm_dock_mouse_notifications()
+            if event_device_ids is None:
+                event_device_ids = {device_id for device_id, _ in files}
             try:
                 try:
                     with self._device_lock:
-                        self._check_dock_mouse_state()
+                        self._check_dock_mouse_state(event_device_ids, armed_device_ids)
                 except Exception:
                     self.logger.exception("Error in dock mouse monitor")
-                self._wait_for_dock_mouse_event(files)
+                event_device_ids = self._wait_for_dock_mouse_event(files)
             finally:
-                for f in files:
+                for _, f in files:
                     f.close()
 
     def _arm_dock_mouse_notifications(self):
@@ -258,9 +261,13 @@ class RazerDaemon(DBusService):
 
         The driver signals POLLPRI on them when the dock reports a link or
         DPI change; sysfs only does so for changes after the file was read.
+
+        :return: (dock device id, open file) pairs, and the ids of docks whose
+            mouse_connected file is armed
         """
         files = []
-        for _, device_wrapper in list(self._razer_devices.id_items()):
+        armed = set()
+        for device_id, device_wrapper in list(self._razer_devices.id_items()):
             razer_device = device_wrapper.dbus
             if not isinstance(razer_device, RazerMouseDockPro):
                 continue
@@ -274,46 +281,60 @@ class RazerDaemon(DBusService):
                 except OSError:
                     f.close()
                     continue
-                files.append(f)
-        return files
+                files.append((device_id, f))
+                if attribute == "mouse_connected":
+                    armed.add(device_id)
+        return files, armed
 
     def _wait_for_dock_mouse_event(self, files):
+        """
+        Wait for a notification or the timeout
+
+        :return: ids of the docks that signalled; empty on timeout
+        """
         # The short timeout confirms a pending change quickly; the long one is
         # the polling fallback for drivers that never signal.
         timeout = 1 if self._dock_mouse_pending else 5
         if not files:
             time.sleep(timeout)
-            return
+            return set()
         poller = select.poll()
-        for f in files:
+        device_ids = {}
+        for device_id, f in files:
             poller.register(f, select.POLLPRI | select.POLLERR)
-        poller.poll(timeout * 1000)
+            device_ids[f.fileno()] = device_id
+        return {device_ids[fd] for fd, _ in poller.poll(timeout * 1000)}
 
-    def _check_dock_mouse_state(self):
+    def _check_dock_mouse_state(self, event_device_ids, armed_device_ids):
+        """
+        :param event_device_ids: docks whose tick was woken by a notification
+        :param armed_device_ids: docks whose mouse_connected notification is
+            armed; any other dock is treated as event-driven on every tick
+        """
         for device_id, device_wrapper in list(self._razer_devices.id_items()):
             razer_device = device_wrapper.dbus
             if not isinstance(razer_device, RazerMouseDockPro):
                 continue
             try:
-                self._check_dock_mouse(device_id, razer_device)
+                self._check_dock_mouse(device_id, razer_device,
+                                       device_id in event_device_ids or device_id not in armed_device_ids)
             except Exception:
                 self.logger.exception("Error checking dock mouse state for %s", device_id)
 
-    def _check_dock_mouse(self, device_id, razer_device):
+    def _check_dock_mouse(self, device_id, razer_device, event_driven):
         child_id = device_id + ':mouse'
         child_present = child_id in self._razer_devices
         current = None
         if child_present:
             child = self._razer_devices[child_id].dbus
             current = child.WIRELESS_PID, child.get_serial()
-        # A same-PID mouse swap needs a pair cycle, which drops the link
-        # state and is observed as a transition, so the RF serial read is
-        # only needed while a change is pending.
-        expected = current if device_id not in self._dock_mouse_pending else None
+        # A mouse swap always raises a link or DPI notification, so only a
+        # timeout tick with nothing pending can skip the RF serial read.
+        expected = None if event_driven or device_id in self._dock_mouse_pending else current
         try:
             connected = razer_device.is_mouse_connected()
             identity = razer_device.get_active_mouse_identity(expected=expected) if connected else None
-        except (OSError, ValueError):
+        except OSError:
             # A busy RF control channel or a malformed status token does not
             # establish a disconnect. It also interrupts the sequence of
             # matching observations.
@@ -324,11 +345,8 @@ class RazerDaemon(DBusService):
         if identity == current:
             self._dock_mouse_pending.pop(device_id, None)
             if child_present:
-                try:
-                    child.update_dpi_from_report(child.read_reported_dpi())
-                    child.retry_pending_restore()
-                except Exception:
-                    self.logger.exception("Error updating docked mouse %s", child_id)
+                child.update_dpi_from_report(child.read_reported_dpi())
+                child.retry_pending_restore()
             return
 
         # Require two matching observations before a lifecycle change;
@@ -368,14 +386,26 @@ class RazerDaemon(DBusService):
             return
         # The dock reports the mouse gone, so reading its DPI over RF
         # would only time out.
-        self._teardown_device(child, read_hardware=False)
         try:
-            parent = self._razer_devices[child_id.rsplit(':mouse', 1)[0]]
-            if child_id in parent.child_ids:
-                parent.child_ids.remove(child_id)
-        except IndexError:
-            pass
-        self.device_removed()
+            self._teardown_device(child, read_hardware=False)
+        except Exception:
+            # Free the D-Bus path so a later dock of the same mouse can export it.
+            try:
+                child.dbus.remove_from_connection()
+            except LookupError:
+                pass
+            raise
+        finally:
+            # A failed teardown must still leave the child fully unregistered.
+            if child_id in self._razer_devices:
+                del self._razer_devices[child_id]
+            try:
+                parent = self._razer_devices[child_id.rsplit(':mouse', 1)[0]]
+                if child_id in parent.child_ids:
+                    parent.child_ids.remove(child_id)
+            except IndexError:
+                pass
+            self.device_removed()
 
     def _init_signals(self):
         """
@@ -476,36 +506,33 @@ class RazerDaemon(DBusService):
             return
 
         with self._device_lock:
-            self._write_persistence(persistence_file)
+            self.logger.debug('Writing persistence config')
 
-    def _write_persistence(self, persistence_file):
-        self.logger.debug('Writing persistence config')
+            for device in self._razer_devices:
+                self._persistence[device.dbus.storage_name] = {}
+                if (('set_dpi_xy' in device.dbus.METHODS or 'set_dpi_xy_byte' in device.dbus.METHODS)
+                        and getattr(device.dbus, '_dock_dpi_known', True)):
+                    dpi_x = int(device.dbus.dpi[0])
+                    dpi_y = int(device.dbus.dpi[1])
+                    # When Y is not greater than 0 check for a DPI X only device, a device with 'available_dpi' and a Y value of 0
+                    if dpi_x > 0 and (dpi_y > 0 or ('available_dpi' in device.dbus.METHODS and dpi_y == 0)):
+                        self._persistence[device.dbus.storage_name]['dpi_x'] = str(dpi_x)
+                        self._persistence[device.dbus.storage_name]['dpi_y'] = str(dpi_y)
 
-        for device in self._razer_devices:
-            self._persistence[device.dbus.storage_name] = {}
-            if (('set_dpi_xy' in device.dbus.METHODS or 'set_dpi_xy_byte' in device.dbus.METHODS)
-                    and getattr(device.dbus, '_dock_dpi_known', True)):
-                dpi_x = int(device.dbus.dpi[0])
-                dpi_y = int(device.dbus.dpi[1])
-                # When Y is not greater than 0 check for a DPI X only device, a device with 'available_dpi' and a Y value of 0
-                if dpi_x > 0 and (dpi_y > 0 or ('available_dpi' in device.dbus.METHODS and dpi_y == 0)):
-                    self._persistence[device.dbus.storage_name]['dpi_x'] = str(dpi_x)
-                    self._persistence[device.dbus.storage_name]['dpi_y'] = str(dpi_y)
+                if 'set_poll_rate' in device.dbus.METHODS and getattr(device.dbus, '_dock_poll_rate_known', True):
+                    self._persistence[device.dbus.storage_name]['poll_rate'] = str(device.dbus.poll_rate)
 
-            if 'set_poll_rate' in device.dbus.METHODS and getattr(device.dbus, '_dock_poll_rate_known', True):
-                self._persistence[device.dbus.storage_name]['poll_rate'] = str(device.dbus.poll_rate)
+                for i in device.dbus.ZONES:
+                    if device.dbus.zone[i]["present"]:
+                        self._persistence[device.dbus.storage_name][i + '_active'] = str(device.dbus.zone[i]["active"])
+                        self._persistence[device.dbus.storage_name][i + '_brightness'] = str(device.dbus.zone[i]["brightness"])
+                        self._persistence[device.dbus.storage_name][i + '_effect'] = device.dbus.zone[i]["effect"]
+                        self._persistence[device.dbus.storage_name][i + '_colors'] = ' '.join(str(i) for i in device.dbus.zone[i]["colors"])
+                        self._persistence[device.dbus.storage_name][i + '_speed'] = str(device.dbus.zone[i]["speed"])
+                        self._persistence[device.dbus.storage_name][i + '_wave_dir'] = str(device.dbus.zone[i]["wave_dir"])
 
-            for i in device.dbus.ZONES:
-                if device.dbus.zone[i]["present"]:
-                    self._persistence[device.dbus.storage_name][i + '_active'] = str(device.dbus.zone[i]["active"])
-                    self._persistence[device.dbus.storage_name][i + '_brightness'] = str(device.dbus.zone[i]["brightness"])
-                    self._persistence[device.dbus.storage_name][i + '_effect'] = device.dbus.zone[i]["effect"]
-                    self._persistence[device.dbus.storage_name][i + '_colors'] = ' '.join(str(i) for i in device.dbus.zone[i]["colors"])
-                    self._persistence[device.dbus.storage_name][i + '_speed'] = str(device.dbus.zone[i]["speed"])
-                    self._persistence[device.dbus.storage_name][i + '_wave_dir'] = str(device.dbus.zone[i]["wave_dir"])
-
-        with open(persistence_file, 'w') as cf:
-            self._persistence.write(cf)
+            with open(persistence_file, 'w') as cf:
+                self._persistence.write(cf)
 
     def get_off_on_screensaver(self):
         """

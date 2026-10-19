@@ -3,6 +3,7 @@
 """
 Mug class
 """
+import errno
 import re
 
 from openrazer_daemon.hardware.device_base import RazerDeviceBrightnessSuspend as _RazerDeviceBrightnessSuspend
@@ -131,7 +132,7 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
     def get_child_devices(self):
         try:
             identity = self.get_active_mouse_identity()
-        except (OSError, ValueError):
+        except OSError:
             return []
         if identity is None:
             return []
@@ -145,12 +146,24 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
         return [(docked_class, {"id_suffix": ":mouse", "serial": serial})]
 
     def get_paired_slots(self):
-        """Return (slot, available, PID) for every reported dock slot."""
+        """
+        Return (slot, available, PID) for every reported dock slot.
+
+        A malformed token raises OSError(EIO), the same transient class as a
+        failed read. Any decimal availability value is accepted; only 1 means
+        available.
+        """
         with open(self.get_driver_path("paired_slots")) as f:
             values = f.read().split()
-        return [(int(slot), available == '1', pid)
-                for value in values
-                for slot, available, pid in [value.split(':')]]
+        slots = []
+        for value in values:
+            fields = value.split(':')
+            if (len(fields) != 3 or not fields[0].isdecimal()
+                    or not fields[1].isdecimal()
+                    or not re.fullmatch(r'[0-9a-fA-F]{4}', fields[2])):
+                raise OSError(errno.EIO, 'malformed paired_slots: ' + value)
+            slots.append((int(fields[0]), fields[1] == '1', fields[2]))
+        return slots
 
     def get_active_mouse_identity(self, expected=None):
         """
@@ -162,33 +175,19 @@ class RazerMouseDockPro(_RazerDeviceBrightnessSuspend):
         slots = self.get_paired_slots()
         if not slots or slots[0][0] != 1 or not slots[0][1]:
             return None
-        try:
-            pid = int(slots[0][2], 16)
-            if pid not in self._get_wireless_pid_registry():
-                return None
-            if expected is not None and expected[0] == pid:
-                return expected
-            with open(self.get_driver_path("mouse_serial")) as f:
-                serial = f.read().strip()
-            confirmed_slots = self.get_paired_slots()
-        except ValueError:
+        pid = int(slots[0][2], 16)
+        if pid not in self._get_wireless_pid_registry():
             return None
+        if expected is not None and expected[0] == pid:
+            return expected
+        with open(self.get_driver_path("mouse_serial"), errors='replace') as f:
+            serial = f.read().strip()
+        confirmed_slots = self.get_paired_slots()
         if not confirmed_slots or confirmed_slots[0] != slots[0]:
             return None
         if not re.fullmatch(r'[\dA-Z]+', serial):
             return None
         return pid, serial
-
-    def _read_paired_pid(self):
-        """Return the USB PID of the currently paired mouse, or None if unavailable."""
-        try:
-            with open(self.get_driver_path("paired_pid")) as f:
-                value = f.read().strip()
-                if not value or value == "0000":
-                    return None
-                return int(value, 16)
-        except (OSError, ValueError):
-            return None
 
     def is_mouse_connected(self):
         with open(self.get_driver_path("mouse_connected")) as f:
